@@ -11,7 +11,7 @@
     },
     "packages/cli": {
       "name": "base44",
-      "version": "0.1.7",
+      "version": "0.1.14",
       "bin": {
         "base44": "./bin/run.js",
       },
