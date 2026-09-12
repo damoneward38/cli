@@ -1,0 +1,6 @@
+{
+  "name": "CRM",
+  "plugin": {
+    "namespace": "crm"
+  }
+}

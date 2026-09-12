@@ -1,0 +1,239 @@
+name: Package Preview Publish
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# This workflow deliberately does NOT run the Wix gateway proxy: the gateway
+# cannot carry `npm publish` (it rejects `PUT /<package>`), so per secplatform's
+# interim policy for OSS repos this job relies on `--frozen-lockfile` plus
+# bunfig.toml's minimumReleaseAge instead. It resolves nothing, so dropping the
+# gateway does not widen what it can pull. Exemption lives in
+# .github/scripts/check_wix_proxy_steps.py.
+jobs:
+  publish-preview:
+    runs-on: ubuntu-latest
+    permissions:
+      # id-token: write for npm trusted publishing (OIDC).
+      # pull-requests: write for the install-instructions comment.
+      contents: read
+      id-token: write
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: packages/cli
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # No `npm install -g npm@latest`: trusted publishing needs npm >= 11.5.1, and
+      # the npm bundled with .node-version's Node 24 is already newer.
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: ".node-version"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Setup Bun
+        id: setup-bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
+      - name: Cache Bun dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ steps.setup-bun.outputs.bun-version }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-${{ steps.setup-bun.outputs.bun-version }}-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: .
+
+      - name: Build package
+        run: bun run build
+
+      - name: Generate preview package name and version
+        id: preview_info
+        run: |
+          PR_NUMBER="${{ github.event.number }}"
+          COMMIT_HASH="${{ github.sha }}"
+          SHORT_COMMIT="${COMMIT_HASH:0:7}"
+
+          # Get current version from package.json
+          BASE_VERSION=$(node -p "require('./package.json').version")
+
+          if [ ! -z "$PR_NUMBER" ]; then
+            # Format: 0.0.1-pr.123.abc1234 (valid semver prerelease)
+            PREVIEW_VERSION="$BASE_VERSION-pr.$PR_NUMBER.$SHORT_COMMIT"
+          else
+            # Format: 0.0.1-dev.abc1234 (valid semver prerelease)
+            PREVIEW_VERSION="$BASE_VERSION-dev.$SHORT_COMMIT"
+          fi
+
+          echo "version=$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+          echo "package_name=@base44-preview/cli" >> $GITHUB_OUTPUT
+          echo "full_package=@base44-preview/cli@$PREVIEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update package.json for preview
+        run: |
+          # Create a backup of original package.json
+          cp package.json package.json.bak
+
+          # Get the official package name for safety checks
+          OFFICIAL_PACKAGE=$(node -p "require('./package.json').name")
+          PREVIEW_PACKAGE="${{ steps.preview_info.outputs.package_name }}"
+
+          echo "Official package: $OFFICIAL_PACKAGE"
+          echo "Preview package: $PREVIEW_PACKAGE"
+
+          # Safety check: Ensure we're not accidentally using the official package name
+          if [ "$PREVIEW_PACKAGE" = "$OFFICIAL_PACKAGE" ]; then
+            echo "❌ ERROR: Preview package name matches official package name!"
+            echo "This would overwrite the official package. Aborting."
+            exit 1
+          fi
+
+          # `npm pkg set` replaces `bunx json-bump`, which fetched an undeclared
+          # package at run time, outside the cooldown.
+          if ! npm pkg set name="$PREVIEW_PACKAGE"; then
+            echo "❌ ERROR: Failed to set package name to $PREVIEW_PACKAGE"
+            exit 1
+          fi
+
+          if ! npm pkg set version="${{ steps.preview_info.outputs.version }}"; then
+            echo "❌ ERROR: Failed to set package version to ${{ steps.preview_info.outputs.version }}"
+            exit 1
+          fi
+
+          echo "✅ Package.json updated successfully"
+
+      - name: Final safety check before publish
+        run: |
+          # Double-check package name one more time before publishing
+          CURRENT_PACKAGE_NAME=$(node -p "require('./package.json').name")
+          OFFICIAL_PACKAGE=$(jq -r '.name' package.json.bak)
+
+          echo "About to publish: $CURRENT_PACKAGE_NAME"
+
+          if [ "$CURRENT_PACKAGE_NAME" = "$OFFICIAL_PACKAGE" ]; then
+            echo "❌ CRITICAL ERROR: About to publish to official package name!"
+            echo "This is not allowed. Check the workflow configuration."
+            exit 1
+          fi
+
+          echo "✅ Safety check passed. Package name is safe to publish."
+
+      - name: Publish preview package
+        # Authenticates via npm trusted publishing (OIDC), so no NPM_TOKEN reaches
+        # the build. Needs a trusted publisher for `@base44-preview/cli` on
+        # npmjs.com registered against this repo and this workflow filename — the
+        # registry keys on the filename, so this needs its own entry, separate from
+        # manual-publish.yml.
+        run: |
+          # Remove devDependencies before publish (everything is bundled)
+          jq 'del(.devDependencies)' package.json > package.json.tmp && mv package.json.tmp package.json
+          if npm publish --tag preview; then
+            echo "✅ Package published successfully"
+          else
+            echo "❌ Package publish failed"
+            exit 1
+          fi
+
+      - name: Restore original package.json
+        if: always()
+        run: |
+          if [ -f package.json.bak ]; then
+            mv package.json.bak package.json
+            echo "✅ Original package.json restored"
+          else
+            echo "❌ WARNING: Backup file package.json.bak not found"
+            echo "This could indicate an earlier step failed"
+          fi
+
+      - name: Comment PR with install instructions
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            const fullPackage = '${{ steps.preview_info.outputs.full_package }}';
+            const installCmd = `npm i ${fullPackage}`;
+            const aliasInstallCmd = `npm i "base44@npm:${fullPackage}"`;
+
+            const body = `### 🚀 Package Preview Available!
+
+            ---
+
+            **Install this PR's preview build with npm:**
+
+            \`\`\`sh
+            ${installCmd}
+            \`\`\`
+
+            **Prefer not to change any import paths? Install using npm alias so your code still imports \`base44\`:**
+
+            \`\`\`sh
+            ${aliasInstallCmd}
+            \`\`\`
+
+            Or add it to your \`package.json\` dependencies:
+
+            \`\`\`json
+            {
+              "dependencies": {
+                "base44": "npm:${fullPackage}"
+              }
+            }
+            \`\`\`
+
+            - 📦 **Preview Package**: \`${fullPackage}\`
+            - 🔗 [View this commit on GitHub](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+
+            ---
+            <sub>Preview published to npm registry — try new features instantly!</sub>`;
+
+            const botCommentIdentifier = '### 🚀 Package Preview Available!';
+
+            async function findBotComment(issueNumber) {
+              if (!issueNumber) return null;
+              const comments = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+              });
+              return comments.data.find((comment) =>
+                comment.body.includes(botCommentIdentifier)
+              );
+            }
+
+            async function createOrUpdateComment(issueNumber) {
+              if (!issueNumber) {
+                console.log('No issue number provided. Cannot post or update comment.');
+                return;
+              }
+
+              const existingComment = await findBotComment(issueNumber);
+              if (existingComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existingComment.id,
+                  body: body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  issue_number: issueNumber,
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  body: body,
+                });
+              }
+            }
+
+            if (context.eventName === 'pull_request') {
+              if (context.issue.number) {
+                await createOrUpdateComment(context.issue.number);
+              }
+            }

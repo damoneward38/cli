@@ -1,0 +1,190 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { setupCLITests } from "./testkit/index.js";
+
+describe("create command", () => {
+  const t = setupCLITests();
+
+  // ─── NON-INTERACTIVE MODE ─────────────────────────────────────
+
+  it("fails when name and path are missing in non-interactive mode", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockCreateApp({ id: "app-123", name: "test" });
+
+    const result = await t.run("create");
+
+    t.expectResult(result).toFail();
+    t.expectResult(result).toContain("required in non-interactive mode");
+  });
+
+  it("fails when --path is provided without name argument", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+
+    const result = await t.run("create", "--path", "./my-project");
+
+    t.expectResult(result).toFail();
+    t.expectResult(result).toContain("--path requires a project name argument");
+  });
+
+  it("rejects explicit --app-id", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+
+    const result = await t.run("create", "My App", "--app-id", "ignored-app");
+
+    t.expectResult(result).toFail();
+    t.expectResult(result).toContain(
+      "base44 create cannot be used with --app-id or BASE44_APP_ID",
+    );
+  });
+
+  it("rejects BASE44_APP_ID", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.givenEnv({ BASE44_APP_ID: "ambient-app-id" });
+
+    const result = await t.run("create", "My App", "--no-skills");
+
+    t.expectResult(result).toFail();
+    t.expectResult(result).toContain(
+      "base44 create cannot be used with --app-id or BASE44_APP_ID",
+    );
+  });
+
+  it("creates project in non-interactive mode", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockCreateApp({ id: "new-project-id", name: "My New Project" });
+
+    const projectPath = join(t.getTempDir(), "my-new-project");
+
+    const result = await t.run(
+      "create",
+      "My New Project",
+      "--path",
+      projectPath,
+      "--no-skills",
+    );
+
+    t.expectResult(result).toSucceed();
+    t.expectResult(result).toContain("Project created successfully");
+    t.expectResult(result).toContain("My New Project");
+    t.expectResult(result).toContain("new-project-id");
+
+    const config = await readFile(
+      join(projectPath, "base44", "config.jsonc"),
+      "utf-8",
+    );
+    expect(config).toContain('"visibility": "public"');
+  });
+
+  it("scaffolds backend-and-client with the editor-app client convention", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockCreateApp({ id: "convention-app-id", name: "Convention App" });
+
+    const projectPath = join(t.getTempDir(), "convention-app");
+
+    const result = await t.run(
+      "create",
+      "Convention App",
+      "--path",
+      projectPath,
+      "--template",
+      "backend-and-client",
+      "--no-skills",
+    );
+
+    t.expectResult(result).toSucceed();
+
+    const client = await readFile(
+      join(projectPath, "src", "api", "base44Client.js"),
+      "utf-8",
+    );
+    expect(client).toContain("serverUrl: ''");
+    expect(client).toContain("@/lib/app-params");
+    expect(client).not.toContain("convention-app-id");
+
+    const appParams = await readFile(
+      join(projectPath, "src", "lib", "app-params.js"),
+      "utf-8",
+    );
+    expect(appParams).toContain("VITE_BASE44_APP_ID");
+    expect(appParams).toContain("VITE_BASE44_APP_BASE_URL");
+
+    const viteConfig = await readFile(
+      join(projectPath, "vite.config.js"),
+      "utf-8",
+    );
+    expect(viteConfig).toContain("@base44/vite-plugin");
+
+    const appConfig = await readFile(
+      join(projectPath, "base44", ".app.jsonc"),
+      "utf-8",
+    );
+    expect(appConfig).toContain("convention-app-id");
+  });
+
+  it("infers path from name when --path is not provided", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockCreateApp({ id: "inferred-path-id", name: "My App" });
+
+    const result = await t.run("create", "My App", "--no-skills");
+
+    t.expectResult(result).toSucceed();
+    t.expectResult(result).toContain("Creating a new project at");
+    t.expectResult(result).toContain("Project created successfully");
+  });
+
+  it("creates project with custom template", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockCreateApp({
+      id: "templated-project-id",
+      name: "Templated Project",
+    });
+
+    const projectPath = join(t.getTempDir(), "templated-project");
+
+    const result = await t.run(
+      "create",
+      "Templated Project",
+      "--path",
+      projectPath,
+      "--template",
+      "backend-only",
+      "--no-skills",
+    );
+
+    t.expectResult(result).toSucceed();
+    t.expectResult(result).toContain("Project created successfully");
+  });
+
+  // ─── WORKSPACE TARGETING ──────────────────────────────────────
+
+  it("creates the app in the workspace passed via --workspace", async () => {
+    await t.givenLoggedIn({ email: "test@example.com", name: "Test User" });
+    t.api.mockListWorkspaces([
+      { id: "ws-personal", name: "Personal", user_role: "owner" },
+      { id: "ws-acme", name: "Acme Inc", user_role: "admin" },
+    ]);
+    // Reflect the received organization_id back in the created app id so the
+    // test can prove it was forwarded in the POST body.
+    t.api.mockRoute("POST", "/api/apps", (req, res) => {
+      res.status(200).json({
+        id: `app-in-${req.body.organization_id ?? "personal"}`,
+        name: req.body.name,
+      });
+    });
+
+    const projectPath = join(t.getTempDir(), "ws-app");
+    const result = await t.run(
+      "create",
+      "WS App",
+      "--path",
+      projectPath,
+      "--workspace",
+      "ws-acme",
+      "--no-skills",
+    );
+
+    t.expectResult(result).toSucceed();
+    t.expectResult(result).toContain("app-in-ws-acme");
+  });
+});

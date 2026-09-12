@@ -1,0 +1,6 @@
+{
+  "name": "Billing",
+  "plugin": {
+    "namespace": "billing"
+  }
+}

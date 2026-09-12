@@ -1,0 +1,126 @@
+import { resolve } from "node:path";
+import { hasWorkspaceApiKeyAuth } from "@/core/auth/config.js";
+import { setAppVisibility } from "@/core/project/api.js";
+import type { Visibility } from "@/core/project/schema.js";
+import type { ProjectData } from "@/core/project/types.js";
+import { agentResource } from "@/core/resources/agent/index.js";
+import { agentSkillResource } from "@/core/resources/agent-skill/index.js";
+import { authConfigResource } from "@/core/resources/auth-config/index.js";
+import {
+  type ConnectorSyncResult,
+  pushConnectors,
+} from "@/core/resources/connector/index.js";
+import { entityResource } from "@/core/resources/entity/index.js";
+import {
+  deployFunctionsSequentially,
+  type SingleFunctionDeployResult,
+} from "@/core/resources/function/deploy.js";
+import { deploySite } from "@/core/site/index.js";
+
+/**
+ * Checks if there are any resources to deploy in the project.
+ *
+ * @param projectData - The project configuration and resources
+ * @returns true if there are entities, functions, agents, connectors, or a configured site to deploy
+ */
+export function hasResourcesToDeploy(projectData: ProjectData): boolean {
+  const {
+    project,
+    entities,
+    functions,
+    agents,
+    agentSkills,
+    connectors,
+    authConfig,
+  } = projectData;
+  const hasSite = Boolean(project.site?.outputDirectory);
+  const hasEntities = entities.length > 0;
+  const hasFunctions = functions.length > 0;
+  const hasAgents = agents.length > 0;
+  const hasAgentSkills = agentSkills.length > 0;
+  const hasConnectors = connectors.length > 0;
+  const hasAuthConfig = authConfig.length > 0;
+  const hasVisibility = Boolean(project.visibility);
+
+  return (
+    hasEntities ||
+    hasFunctions ||
+    hasAgents ||
+    hasAgentSkills ||
+    hasConnectors ||
+    hasAuthConfig ||
+    hasVisibility ||
+    hasSite
+  );
+}
+
+/**
+ * Result of deploying all project resources.
+ */
+interface DeployAllResult {
+  /**
+   * The app URL if a site was deployed, undefined otherwise.
+   */
+  appUrl?: string;
+  /**
+   * Results of connector push, including any that need OAuth.
+   */
+  connectorResults?: ConnectorSyncResult[];
+}
+
+interface DeployAllOptions {
+  onFunctionStart?: (names: string[]) => void;
+  onFunctionResult?: (result: SingleFunctionDeployResult) => void;
+  onVisibilitySet?: (visibility: Visibility) => void;
+}
+
+/**
+ * Deploys all project resources (entities, functions, agents, connectors, and site) to Base44.
+ *
+ * @param projectData - The project configuration and resources to deploy
+ * @param options - Optional progress callbacks for resource deployment
+ * @returns The deployment result including app URL if site was deployed
+ */
+export async function deployAll(
+  projectData: ProjectData,
+  options?: DeployAllOptions,
+): Promise<DeployAllResult> {
+  const {
+    project,
+    entities,
+    functions,
+    agents,
+    agentSkills,
+    connectors,
+    authConfig,
+  } = projectData;
+
+  await setAppVisibility(project.visibility);
+  if (project.visibility) {
+    options?.onVisibilitySet?.(project.visibility);
+  }
+  await entityResource.push(entities);
+  await deployFunctionsSequentially(functions, {
+    onStart: options?.onFunctionStart,
+    onResult: options?.onFunctionResult,
+  });
+  await agentSkillResource.push(agentSkills);
+  await agentResource.push(agents);
+  await authConfigResource.push(authConfig);
+  // pushConnectors also reconciles: with an empty list it removes remote
+  // connectors that are no longer configured locally. Only skip that when a
+  // workspace API key is in use, since those principals get a 403 on the
+  // connectors-list endpoint. OAuth users must still reconcile removals.
+  const skipConnectorSync = connectors.length === 0 && hasWorkspaceApiKeyAuth();
+  const connectorResults = skipConnectorSync
+    ? []
+    : (await pushConnectors(connectors)).results;
+
+  if (project.site?.outputDirectory) {
+    const outputDir = resolve(project.root, project.site.outputDirectory);
+    const { appUrl } = await deploySite(outputDir);
+    return { appUrl, connectorResults };
+  }
+
+  return { connectorResults };
+}

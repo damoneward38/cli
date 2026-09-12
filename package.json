@@ -1,0 +1,21 @@
+{
+  "name": "base44-cli",
+  "version": "1.0.0",
+  "description": "Base44 Monorepo",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "lint": "biome check packages/*/src packages/*/tests",
+    "lint:fix": "biome check --write packages/*/src packages/*/tests",
+    "typecheck": "bun --workspaces --if-present --sequential run typecheck",
+    "knip": "knip",
+    "knip:fix": "knip --fix"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "knip": "^5.83.1"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}
