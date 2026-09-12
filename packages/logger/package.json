@@ -14,3 +14,10 @@
     "typescript": "^5.7.2"
   }
 }
+exports: {".": "./src/index/index.html"}
+scripts: {
+  "start": "node src/index/index.ts"
+}
+devDependencies: {
+  "@clack/browser": "^1.0.1"
+}
